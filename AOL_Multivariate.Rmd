@@ -1,0 +1,588 @@
+---
+title: "The Effect of Normality Assumption on Canonical Correlation Analysis: Overthinking & Decision-Making Quality"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r libraries}
+library(readxl)
+library(dplyr)
+library(lavaan)
+library(semTools)
+library(semPlot)
+library(MVN)
+library(car)
+library(CCA)
+library(CCP)
+library(kernlab)
+library(huge)
+library(bestNormalize)
+library(MASS)
+library(lmtest)
+```
+
+---
+
+# Dataset
+
+```{r load-data}
+data <- read_excel("MulVar_dataset.xlsx")
+
+item_map <- list(
+  rumination     = paste0("x", 1:4),
+  control        = paste0("x", 5:8),
+  indecisiveness = paste0("x", 9:12),
+  negative       = paste0("x", 13:16),
+  regret         = paste0("x", 17:20),
+  speed          = paste0("y", 1:4),
+  confidence     = paste0("y", 5:8),
+  consistency    = paste0("y", 9:12),
+  evaluation     = paste0("y", 13:16),
+  satisfaction   = paste0("y", 17:20)
+)
+
+dims_X <- c("rumination", "control", "indecisiveness", "negative", "regret")
+dims_Y <- c("speed", "confidence", "consistency", "evaluation", "satisfaction")
+
+cat("Dataset:", nrow(data), "responden,", ncol(data), "item\n")
+```
+
+---
+
+# Step 1 — Diagram Alur (SEM Path Diagram)
+
+Diagram ini menggambarkan struktur pengukuran keseluruhan dimensi
+Overthinking (X) dan Kualitas Keputusan (Y) beserta item-itemnya
+sebelum seleksi validitas dan reliabilitas dilakukan.
+
+```{r diagram-alur, fig.width=10, fig.height=7}
+model_2order <- paste0(
+  paste(sapply(names(item_map), function(d)
+    paste0(d, " =~ ", paste(item_map[[d]], collapse = " + "))
+  ), collapse = "\n"),
+  "\n  Overthinking      =~ ", paste(dims_X, collapse = " + "),
+  "\n  KualitasKeputusan =~ ", paste(dims_Y, collapse = " + ")
+)
+
+fit_diagram <- sem(model_2order, data = data)
+
+semPaths(fit_diagram,
+  what           = "std",
+  layout         = "tree2",
+  rotation       = 1,
+  edge.label.cex = 0.55,
+  sizeMan        = 4,
+  sizeLat        = 9,
+  color = list(lat = c(
+    "Overthinking"      = "#C0392B",
+    "KualitasKeputusan" = "#1A5276",
+    "rumination"        = "#E8A87C",
+    "control"           = "#D4856A",
+    "indecisiveness"    = "#C06B5A",
+    "negative"          = "#A84E3F",
+    "regret"            = "#8B3A2F",
+    "speed"             = "#AED6F1",
+    "confidence"        = "#7FB3D3",
+    "consistency"       = "#5499C7",
+    "evaluation"        = "#2E86C1",
+    "satisfaction"      = "#1A6FA3"
+  ), man = "white"),
+  edge.color = "gray40",
+  label.cex  = 0.7,
+  residuals  = FALSE,
+  intercepts = FALSE,
+  title      = FALSE
+)
+```
+
+---
+
+# Step 2 — Uji Validitas (CFA)
+
+Validitas diukur menggunakan Confirmatory Factor Analysis (CFA).
+Dimensi dinyatakan **valid** jika semua itemnya memiliki standardized loading > 0.7
+dan p-value < 0.05.
+
+```{r validitas}
+model_cfa <- paste(
+  sapply(names(item_map), function(d)
+    paste0(d, " =~ ", paste(item_map[[d]], collapse = " + "))
+  ),
+  collapse = "\n"
+)
+
+fit_cfa <- cfa(model_cfa, data = data)
+
+std_sol  <- standardizedSolution(fit_cfa)
+load_tbl <- std_sol[std_sol$op == "=~", c("lhs", "rhs", "est.std", "pvalue")]
+load_tbl$status <- ifelse(
+  load_tbl$est.std > 0.7 & load_tbl$pvalue < 0.05,
+  "VALID", "TIDAK VALID"
+)
+
+print(load_tbl)
+```
+
+```{r validitas-ringkasan}
+valid_summary <- load_tbl %>%
+  group_by(lhs) %>%
+  summarise(
+    avg_loading = round(mean(abs(est.std)), 3),
+    min_loading = round(min(abs(est.std)), 3),
+    n_item      = n(),
+    n_valid     = sum(status == "VALID"),
+    semua_valid = all(status == "VALID")
+  ) %>%
+  arrange(desc(avg_loading))
+
+print(valid_summary)
+
+cat("\nModel Fit CFA:\n")
+print(fitMeasures(fit_cfa, c("cfi", "tli", "rmsea", "srmr")))
+
+lolos_validitas      <- valid_summary$lhs[valid_summary$semua_valid == TRUE]
+tidak_lolos_validitas <- valid_summary$lhs[valid_summary$semua_valid == FALSE]
+
+cat("\nDimensi LOLOS validitas    :", paste(lolos_validitas, collapse = ", "), "\n")
+cat("Dimensi TIDAK LOLOS validitas:", paste(tidak_lolos_validitas, collapse = ", "), "\n")
+```
+
+---
+
+# Step 3 — Uji Reliabilitas (Omega)
+
+Dimensi dinyatakan **reliabel** jika omega > 0.7.
+Uji ini tetap dilakukan untuk semua dimensi, namun hanya dimensi yang juga lolos validitas yang akan dibawa ke analisis selanjutnya.
+
+```{r reliabilitas}
+rel_tbl    <- reliability(fit_cfa)
+omega_vals <- rel_tbl["omega", ]
+
+cat("Omega per dimensi:\n")
+print(round(omega_vals, 3))
+
+lolos_reliabilitas <- names(omega_vals)[omega_vals > 0.7]
+cat("\nDimensi LOLOS reliabilitas:", paste(lolos_reliabilitas, collapse = ", "), "\n")
+```
+
+---
+
+# Step 4 — Seleksi Dimensi Final
+
+Hanya dimensi yang lolos **keduanya** (validitas DAN reliabilitas) yang digunakan
+untuk semua analisis selanjutnya.
+
+```{r seleksi-dimensi}
+lolos_semua <- intersect(lolos_validitas, lolos_reliabilitas)
+final_X     <- intersect(dims_X, lolos_semua)
+final_Y     <- intersect(dims_Y, lolos_semua)
+
+cat("Dimensi X final:", paste(final_X, collapse = ", "), "\n")
+cat("Dimensi Y final:", paste(final_Y, collapse = ", "), "\n")
+
+# Skor dimensi — hanya dari dimensi yang lolos
+skor_list <- lapply(c(final_X, final_Y), function(d)
+  rowMeans(data[, item_map[[d]]], na.rm = TRUE))
+skor_dim  <- as.data.frame(skor_list)
+colnames(skor_dim) <- c(final_X, final_Y)
+
+# Variabel yang dipakai di semua step berikutnya
+n_x  <- length(final_X)
+n_y  <- length(final_Y)
+n    <- nrow(skor_dim)
+n_cf <- min(n_x, n_y)
+
+X_raw <- as.matrix(skor_dim[, 1:n_x])
+Y_raw <- as.matrix(skor_dim[, (n_x + 1):(n_x + n_y)])
+X_sc  <- scale(X_raw)
+Y_sc  <- scale(Y_raw)
+
+cat("\nStatistik Deskriptif:\n")
+print(round(t(sapply(skor_dim, function(x)
+  c(Mean = mean(x), SD = sd(x), Min = min(x),
+    Max = max(x), Skew = mean(((x - mean(x)) / sd(x))^3))
+)), 3))
+```
+
+---
+
+# Step 5 — Uji Linearitas (Ramsey RESET Test)
+
+Uji linearitas dilakukan hanya pada dimensi yang sudah lolos seleksi,
+karena hanya dimensi ini yang masuk ke CCA.
+Hipotesis nol: hubungan bersifat linear. p > 0.05 berarti linear.
+
+```{r linearitas}
+# Y_total dari dimensi Y yang lolos
+Y_total <- rowMeans(skor_dim[, (n_x + 1):(n_x + n_y)])
+
+cat(sprintf("%-20s | F-stat  | p-value | Kesimpulan\n", "Dimensi X"))
+
+for (xd in final_X) {
+  rst <- resettest(
+    lm(Y_total ~ skor_dim[[xd]]),
+    power = 2:3,
+    type  = "fitted"
+  )
+  cat(sprintf("%-20s | %7.3f | %7.4f  | %s\n",
+    xd, rst$statistic, rst$p.value,
+    ifelse(rst$p.value > 0.05, "LINEAR", "NON-LINEAR")))
+}
+```
+
+---
+
+# Step 6 — Uji Normalitas Multivariat (Mardia's Test)
+
+Uji normalitas multivariat menggunakan Mardia's skewness dan kurtosis,
+hanya pada dimensi yang lolos seleksi.
+p < 0.05 berarti data tidak berdistribusi normal multivariat.
+
+```{r normalitas}
+cat("Overthinking (X)\n")
+print(mvn(data = skor_dim[, 1:n_x], mvn = "mardia")$multivariate_normality)
+
+cat("\nDecision-Making Quality (Y)\n")
+print(mvn(data = skor_dim[, (n_x + 1):(n_x + n_y)], mvn = "mardia")$multivariate_normality)
+```
+
+---
+
+# Step 7 — Handling Non-Normality: Transformasi Data
+
+Karena data tidak normal, dicoba 8 metode transformasi.
+Setiap metode dicek apakah berhasil menormalkan distribusi,
+kemudian dijalankan CCA untuk membandingkan hasilnya.
+
+```{r transformasi-setup}
+# Fungsi-fungsi transformasi
+boxcox_col <- function(x) {
+  bc  <- MASS::boxcox(x ~ 1, lambda = seq(-2, 2, 0.1), plotit = FALSE)
+  lam <- bc$x[which.max(bc$y)]
+  if (abs(lam) < 0.001) log(x) else (x^lam - 1) / lam
+}
+
+yj_col  <- function(x) yeojohnson(x)$x.t
+rk_col  <- function(x) qnorm(rank(x) / (length(x) + 1))
+orq_col <- function(x) suppressWarnings(orderNorm(x)$x.t)
+
+# NPN transformation
+npn_all  <- huge.npn(as.matrix(skor_dim), npn.func = "truncation")
+skor_npn <- as.data.frame(npn_all)
+colnames(skor_npn) <- c(final_X, final_Y)
+
+# Daftar semua transformasi
+transforms <- list(
+  "1. Raw (baseline)" = list(X = X_raw,                         Y = Y_raw),
+  "2. Log"            = list(X = log(X_raw),                    Y = log(Y_raw)),
+  "3. Sqrt"           = list(X = sqrt(X_raw),                   Y = sqrt(Y_raw)),
+  "4. Box-Cox"        = list(X = apply(X_raw, 2, boxcox_col),   Y = apply(Y_raw, 2, boxcox_col)),
+  "5. Yeo-Johnson"    = list(X = apply(X_raw, 2, yj_col),       Y = apply(Y_raw, 2, yj_col)),
+  "6. NPN"            = list(X = as.matrix(skor_npn[, 1:n_x]),  Y = as.matrix(skor_npn[, (n_x+1):(n_x+n_y)])),
+  "7. Rank+qnorm"     = list(X = apply(X_raw, 2, rk_col),       Y = apply(Y_raw, 2, rk_col)),
+  "8. ORQ"            = list(X = apply(X_raw, 2, orq_col),      Y = apply(Y_raw, 2, orq_col))
+)
+```
+
+```{r transformasi-mvn}
+# CEK MVN setelah tiap transformasi
+cat(sprintf("%-22s | %-10s | %-10s | %-10s | %-10s | Ket\n",
+  "Metode", "X skew p", "X kurt p", "Y skew p", "Y kurt p"))
+
+mvn_summary <- list()
+for (nm in names(transforms)) {
+  td <- transforms[[nm]]
+  mx <- mvn(data = as.data.frame(td$X), mvn = "mardia")$multivariate_normality
+  my <- mvn(data = as.data.frame(td$Y), mvn = "mardia")$multivariate_normality
+
+  xp   <- suppressWarnings(as.numeric(mx$p.value[1]))
+  yp   <- suppressWarnings(as.numeric(my$p.value[1]))
+  x_ok <- !is.na(xp) && xp > 0.05
+  y_ok <- !is.na(yp) && yp > 0.05
+  ket  <- ifelse(x_ok & y_ok, "NORMAL",
+          ifelse(x_ok | y_ok, "PARSIAL", "TIDAK NORMAL"))
+
+  mvn_summary[[nm]] <- list(x_ok = x_ok, y_ok = y_ok)
+
+  cat(sprintf("%-22s | %-10s | %-10s | %-10s | %-10s | %s\n",
+    nm, mx$p.value[1], mx$p.value[2],
+    my$p.value[1], my$p.value[2], ket))
+}
+```
+
+```{r transformasi-cca}
+# CCA untuk tiap transformasi
+cat(sprintf("%-22s | %s | p_CF1    | p_CF2    | CF_sig\n",
+  "Metode",
+  paste(sprintf("r%-5d", 1:n_cf), collapse = " | ")))
+
+transform_results <- list()
+for (nm in names(transforms)) {
+  td  <- transforms[[nm]]
+  Xs  <- scale(td$X)
+  Ys  <- scale(td$Y)
+  res <- cc(Xs, Ys)
+  sig <- p.asym(res$cor, nrow(Xs), ncol(Xs), ncol(Ys), tstat = "Wilks")
+
+  transform_results[[nm]] <- list(
+    r      = res$cor,
+    p_val  = sig$p.value,
+    n_sig  = sum(sig$p.value < 0.05, na.rm = TRUE),
+    cc_obj = res,
+    Xs     = Xs,
+    Ys     = Ys
+  )
+
+  cat(sprintf("%-22s | %s | %-9.5f| %-9.5f| %d\n",
+    nm,
+    paste(sprintf("%.4f ", res$cor[1:n_cf]), collapse = " | "),
+    sig$p.value[1], sig$p.value[2],
+    sum(sig$p.value < 0.05, na.rm = TRUE)))
+}
+```
+
+---
+
+# Step 8 — Distribution-Free Alternative: Kernel CCA
+
+Kernel CCA tidak mentransformasi data dan tidak mensyaratkan normalitas,
+karena bekerja di ruang kernel (RKHS) yang bebas distribusi.
+Kernel CCA dimasukkan sebagai pembanding untuk melihat apakah pendekatan
+non-parametrik menghasilkan r yang berbeda secara signifikan.
+
+```{r kernel-tuning}
+cat("Tuning sigma untuk RBF Kernel:\n")
+cat(sprintf("%-14s | r1      | Ket\n", "Sigma"))
+
+for (s in c(0.01, 0.05, 0.1, 0.5, 1.0)) {
+  k  <- kcca(X_sc, Y_sc,
+             kernel = "rbfdot",
+             kpar   = list(sigma = s),
+             ncomps = 1,
+             decomp = "chol",
+             scale  = FALSE)
+  r1 <- round(abs(kcor(k)[1]), 4)
+  cat(sprintf("sigma = %-6.2f | %.4f  | %s\n",
+    s, r1, ifelse(r1 > 0.99, "OVERFIT", "OK")))
+}
+```
+
+```{r kernel-cca}
+kcca_lin  <- kcca(X_sc, Y_sc,
+                  kernel = "vanilladot", kpar = list(),
+                  ncomps = n_cf, decomp = "chol", scale = FALSE)
+
+kcca_rbf  <- kcca(X_sc, Y_sc,
+                  kernel = "rbfdot", kpar = list(sigma = 0.1),
+                  ncomps = n_cf, decomp = "chol", scale = FALSE)
+
+kcca_poly <- kcca(X_sc, Y_sc,
+                  kernel = "polydot",
+                  kpar   = list(degree = 2, scale = 1, offset = 1),
+                  ncomps = n_cf, decomp = "chol", scale = FALSE)
+
+kernel_results <- list(
+  "9.  kCCA Linear"      = abs(kcor(kcca_lin)),
+  "10. kCCA RBF (s=0.1)" = abs(kcor(kcca_rbf)),
+  "11. kCCA Poly (d=2)"  = abs(kcor(kcca_poly))
+)
+
+cat(sprintf("%-24s | %s | Ket\n",
+  "Metode",
+  paste(sprintf("r%-5d", 1:n_cf), collapse = " | ")))
+
+for (nm in names(kernel_results)) {
+  r <- kernel_results[[nm]]
+  cat(sprintf("%-24s | %s | %s\n",
+    nm,
+    paste(sprintf("%.4f ", r[1:n_cf]), collapse = " | "),
+    ifelse(max(r) > 0.95, "OVERFIT", "OK")))
+}
+```
+
+---
+
+# Step 9 — Perbandingan Semua Metode
+
+Semua 11 metode (8 transformasi + 3 kernel) dibandingkan dalam satu tabel.
+**Apakah metode normality handling mempengaruhi hasil CCA?**
+
+```{r perbandingan-gabungan}
+cat(sprintf("%-24s| %-9s| %s | %-9s| %-9s| %-6s| %s\n",
+  "Metode", "Tipe",
+  paste(sprintf("r%-5d ", 1:n_cf), collapse = "| "),
+  "p_CF1", "p_CF2", "n_sig", "Ket"))
+
+# transformasi
+for (nm in names(transform_results)) {
+  res <- transform_results[[nm]]
+  cat(sprintf("%-24s| %-9s| %s | %-9.5f| %-9.5f| %-6d| %s\n",
+    nm, "Transf.",
+    paste(sprintf("%.4f  ", res$r[1:n_cf]), collapse = "| "),
+    res$p_val[1], res$p_val[2], res$n_sig,
+    ifelse(res$p_val[1] < 0.05, "OK", "NS")))
+}
+
+# kernel
+for (nm in names(kernel_results)) {
+  r <- kernel_results[[nm]]
+  cat(sprintf("%-24s| %-9s| %s | %-9s| %-9s| %-6s| %s\n",
+    nm, "Kernel",
+    paste(sprintf("%.4f  ", r[1:n_cf]), collapse = "| "),
+    "N/A", "N/A", "N/A",
+    ifelse(max(r) > 0.95, "OVERFIT", "OK")))
+}
+```
+
+---
+
+# Step 10 — Uji Multikolinearitas
+
+Multikolinearitas dicek menggunakan VIF dan Tolerance pada dimensi X final.
+VIF < 10 dan Tolerance > 0.1 berarti tidak ada masalah.
+
+```{r multikolinearitas}
+skor_vif         <- skor_dim
+skor_vif$Y_total <- rowMeans(skor_dim[, (n_x + 1):(n_x + n_y)])
+
+vif_formula <- as.formula(
+  paste("Y_total ~", paste(final_X, collapse = " + "))
+)
+vif_model <- lm(vif_formula, data = skor_vif)
+
+cat("Korelasi antar dimensi X:\n")
+print(round(cor(X_raw), 3))
+
+cat("\nVIF dan Tolerance:\n")
+vif_vals <- vif(vif_model)
+print(data.frame(
+  VIF       = round(vif_vals, 3),
+  Tolerance = round(1 / vif_vals, 3),
+  Status    = ifelse(vif_vals < 10, "AMAN", "MASALAH")
+))
+```
+
+---
+
+# Step 11 — CCA Detail: Metode Terbaik
+
+Dipilih otomatis dari transformasi: r CF1 tertinggi dengan p_CF1 < 0.05
+dan r tidak overfit (< 0.95)
+
+```{r cca-pilih-metode}
+best_nm <- names(which.max(
+  sapply(transform_results, function(r)
+    ifelse(r$p_val[1] < 0.05 & max(r$r) < 0.95, r$r[1], 0))
+))
+best <- transform_results[[best_nm]]
+
+cat("Metode terpilih :", best_nm, "\n")
+cat(sprintf("r CF1 = %.4f | r CF2 = %.4f | CF signifikan = %d\n",
+  best$r[1], best$r[2], best$n_sig))
+```
+
+```{r cca-loadings}
+cc_load <- comput(best$Xs, best$Ys, best$cc_obj)
+
+load_x <- cc_load$corr.X.xscores
+load_y <- cc_load$corr.Y.yscores
+rownames(load_x) <- final_X
+rownames(load_y) <- final_Y
+colnames(load_x) <- paste0("CF", 1:n_cf)
+colnames(load_y) <- paste0("CF", 1:n_cf)
+
+cat("Canonical Loadings X (|loading| >= 0.5 dianggap substantif):\n")
+print(round(load_x, 4))
+
+cat("\nCanonical Loadings Y:\n")
+print(round(load_y, 4))
+```
+
+```{r cca-weights}
+wx <- best$cc_obj$xcoef
+wy <- best$cc_obj$ycoef
+rownames(wx) <- final_X
+rownames(wy) <- final_Y
+colnames(wx) <- paste0("CF", 1:n_cf)
+colnames(wy) <- paste0("CF", 1:n_cf)
+
+cat("Canonical Weights X:\n")
+print(round(wx, 4))
+
+cat("\nCanonical Weights Y:\n")
+print(round(wy, 4))
+```
+
+```{r cca-signifikansi}
+cat("Signifikansi Wilks Lambda:\n")
+cat(sprintf("%-5s| %-7s | %-10s | %s\n", "CF", "r", "p-value", "Ket"))
+
+for (i in 1:n_cf) {
+  cat(sprintf("CF%-3d| %.4f  | %.5f    | %s\n",
+    i, best$r[i], best$p_val[i],
+    ifelse(best$p_val[i] < 0.05, "SIGNIFIKAN*", "tidak signifikan")))
+}
+```
+
+```{r cca-interpretasi}
+lx1   <- load_x[, 1]
+ly1   <- load_y[, 1]
+dom_x <- names(lx1)[abs(lx1) >= 0.5]
+dom_y <- names(ly1)[abs(ly1) >= 0.5]
+
+cat("Dimensi X dominan di CF1 (|loading| >= 0.5):\n")
+if (length(dom_x) > 0) {
+  for (nm in dom_x)
+    cat(sprintf("  %-20s loading = %.4f\n", nm, lx1[nm]))
+} else {
+  cat("  Tidak ada\n")
+}
+
+cat("\nDimensi Y dominan di CF1 (|loading| >= 0.5):\n")
+if (length(dom_y) > 0) {
+  for (nm in dom_y)
+    cat(sprintf("  %-20s loading = %.4f\n", nm, ly1[nm]))
+} else {
+  cat("  Tidak ada\n")
+}
+```
+
+---
+
+# Step 12 — Ringkasan Final
+
+```{r ringkasan}
+cat(sprintf("\nDimensi X final : %s\n", paste(final_X, collapse = ", ")))
+cat(sprintf("Dimensi Y final : %s\n", paste(final_Y, collapse = ", ")))
+cat(sprintf("n               : %d responden\n\n", n))
+
+cat("Transformasi\n")
+tr_r1 <- sapply(transform_results, function(r) r$r[1])
+for (nm in names(sort(tr_r1, decreasing = TRUE))) {
+  res <- transform_results[[nm]]
+  cat(sprintf("  %-22s | r1=%.4f | CF sig=%d | %s\n",
+    nm, res$r[1], res$n_sig,
+    ifelse(res$p_val[1] < 0.05, "Signifikan", "Tidak Signifikan")))
+}
+
+cat("\nKernel CCA\n")
+for (nm in names(kernel_results)) {
+  r <- kernel_results[[nm]]
+  cat(sprintf("  %-24s | r1=%.4f | %s\n",
+    nm, r[1],
+    ifelse(max(r) > 0.95, "OVERFIT", "OK")))
+}
+
+cat(sprintf("\nMETODE TERPILIH : %s\n", best_nm))
+cat(sprintf("r CF1           : %.4f\n", best$r[1]))
+cat(sprintf("r CF2           : %.4f\n", best$r[2]))
+cat(sprintf("CF signifikan   : %d dari %d\n", best$n_sig, n_cf))
+```
